@@ -301,6 +301,88 @@ impl DefaultCellCollector {
             "ckb-indexer server inconsistent with currently connected ckb node or not synced!"
         )))
     }
+
+    fn collect_live_cells_ignore_min_total_capacity(
+        &mut self,
+        query: &CellQueryOptions,
+        apply_changes: bool,
+    ) -> Result<(Vec<LiveCell>, u64), CellCollectorError> {
+        let max_mature_number = get_max_mature_number(&self.ckb_client)
+            .map_err(|err| CellCollectorError::Internal(anyhow!(err)))?;
+
+        self.offchain.max_mature_number = max_mature_number;
+        let tip_num = self
+            .ckb_client
+            .get_tip_block_number()
+            .map_err(|err| CellCollectorError::Internal(anyhow!(err)))?
+            .value();
+        let CollectResult {
+            cells,
+            rest_cells,
+            mut total_capacity,
+        } = self.offchain.collect(query, tip_num);
+        let mut cells: Vec<_> = cells.into_iter().map(|c| c.0).collect();
+
+        if total_capacity < query.min_total_capacity {
+            self.check_ckb_chain()?;
+            let order = match query.order {
+                QueryOrder::Asc => Order::Asc,
+                QueryOrder::Desc => Order::Desc,
+            };
+            let mut ret_cells: HashMap<_, _> = cells
+                .into_iter()
+                .map(|c| (c.out_point.clone(), c))
+                .collect();
+            let locked_cells = self.offchain.locked_cells.clone();
+            let search_key = SearchKey::from(query.clone());
+            const MAX_LIMIT: u32 = 4096;
+            let mut limit: u32 = query.limit.unwrap_or(16);
+            let mut last_cursor: Option<json_types::JsonBytes> = None;
+            while total_capacity < query.min_total_capacity {
+                let page = self
+                    .indexer_client
+                    .get_cells(search_key.clone(), order.clone(), limit.into(), last_cursor)
+                    .map_err(|err| CellCollectorError::Internal(err.into()))?;
+                if page.objects.is_empty() {
+                    break;
+                }
+                for cell in page.objects {
+                    let live_cell = LiveCell::from(cell);
+                    if !query.match_cell(&live_cell, max_mature_number)
+                        || locked_cells.contains_key(&(
+                        live_cell.out_point.tx_hash().unpack(),
+                        live_cell.out_point.index().unpack(),
+                    ))
+                    {
+                        continue;
+                    }
+                    let capacity: u64 = live_cell.output.capacity().unpack();
+                    // use cell from indexer to replace offchain cell
+                    if ret_cells
+                        .insert(live_cell.out_point.clone(), live_cell)
+                        .is_none()
+                    {
+                        total_capacity += capacity;
+                    }
+                    // if total_capacity >= query.min_total_capacity {
+                    //     break;
+                    // }
+                }
+                last_cursor = Some(page.last_cursor);
+                if limit < MAX_LIMIT {
+                    limit *= 2;
+                }
+            }
+            cells = ret_cells.into_values().collect();
+        }
+        if apply_changes {
+            self.offchain.live_cells = rest_cells;
+            for cell in &cells {
+                self.lock_cell(cell.out_point.clone(), tip_num)?;
+            }
+        }
+        Ok((cells, total_capacity))
+    }
 }
 
 impl CellCollector for DefaultCellCollector {
