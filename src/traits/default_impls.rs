@@ -302,7 +302,7 @@ impl DefaultCellCollector {
         )))
     }
 
-    fn collect_live_cells_ignore_min_total_capacity(
+    pub fn collect_live_cells_ignore_min_total_capacity(
         &mut self,
         query: &CellQueryOptions,
         apply_changes: bool,
